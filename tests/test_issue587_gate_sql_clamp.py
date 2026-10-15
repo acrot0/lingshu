@@ -126,6 +126,32 @@ def test_587_promote_from_context_bare_sql_clamped():
         "promote 腿把越界值写回：%r" % stored
 
 
+def test_587_write_snapshot_existing_branch_clamps_stale_overflow_row():
+    """⑦ #672 缺口：`write_snapshot` 的「已存在」腿——库内越界行 + **合法** hint。
+
+    与⑥的区别：⑥ 走 `promote_from_context`，本组走 `write_snapshot`。⑥ 的入库值
+    由 `max(1e6, 0.5)` 决定；本组的关键是 **hint 合法**（0.5）而库内是 1e6——
+    正是 #587 存量复核帖要求的「双入口同值」对照：钳制前 `max(1e6, 0.5)`
+    会把 1e6 原样写回，故本组在修前必红。
+    """
+    e = SpacetimeMemoryEngine(":memory:")
+    gate = e._ensure_gate()
+    content = CONTENT + "（⑦ 存量越界行）"
+    first = gate.write_snapshot(content, source="snapshot", importance_hint=0.5)
+    nid = first.get("node_id")
+    assert nid, "前置：首写未返回 node_id：" + str(first)
+    # 直插越界行（模拟 #587 修复前落库的存量数据 / 旁路写入）
+    e.store.conn.execute("UPDATE nodes SET importance=? WHERE id=?", (1e6, nid))
+    e.store.conn.commit()
+    assert _imp(e, nid) == 1e6, "前置：存量越界行未落库"
+
+    # 同内容二次写（命中 existing 分支）+ 合法 hint
+    gate.write_snapshot(content, source="snapshot", importance_hint=0.5)
+    stored = _imp(e, nid)
+    assert stored is not None and math.isfinite(stored) and stored <= 1.0, \
+        "write_snapshot 已存在腿把越界值写回：%r" % stored
+
+
 if __name__ == "__main__":
     import subprocess
     import sys

@@ -518,5 +518,11 @@ if _ia is not None and _iam is not None:
               "n.importance < degrade_threshold" in _rs3
               and 'n.importance >= rehearsal_threshold:\n                continue' in _rs3, '')
 
-print(f'\n=== N+1 优化守卫: {pass_n}/{pass_n + fail_n} 通过 ===')
-sys.exit(0 if fail_n == 0 else 1)
+def main():
+    print(f'\n=== N+1 优化守卫: {pass_n}/{pass_n + fail_n} 通过 ===')
+    # ★ 不可在模块级调用：失败时 sys.exit(1) 会让 `pytest tests/` 以
+    #   INTERNALERROR(SystemExit) 收场并**停掉其后全部测试**（issue #5 复发面）。
+    return 0 if fail_n == 0 else 1
+
+if __name__ == "__main__":
+    sys.exit(main())

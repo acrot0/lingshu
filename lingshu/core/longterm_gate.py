@@ -385,7 +385,10 @@ class LongTermMemoryGate:
                     engine.store.conn.execute(
                         "UPDATE nodes SET importance=?, tags=?, confidence=?, layer=? "
                         "WHERE id=?",
-                        (max(node.importance, imp),
+                        # #672：node.importance 是库内读回值（可能越界），max() 会让它
+                        # 原样写回；与 promote_from_context 姊妹腿对称，落库前钳制。
+                        # default 取 imp（入口已归一），以保住 #587 的 max 合并语义。
+                        (_finite_clamp(max(node.importance, imp), 0.0, 1.0, default=imp),
                          _json.dumps(tags_merged, ensure_ascii=False),
                          node.confidence, new_layer, existing_id))
                     engine.store.conn.commit()

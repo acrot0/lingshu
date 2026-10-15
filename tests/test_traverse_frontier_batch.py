@@ -129,7 +129,12 @@ _TV = next((n for n in ast.walk(_TREE)
 check('A0 已定位 traverse', _TV is not None, _tp)
 if _TV is None:
     print(f'\n=== traverse 整层批量守卫: {pass_n}/{pass_n + fail_n} 通过 ===')
-    sys.exit(1)
+    if __name__ == "__main__":
+        sys.exit(1)
+    # 脚本模式失败即退出；pytest 收集期则退化为 skip——否则模块级 sys.exit
+    # 会让 `pytest tests/` INTERNALERROR 并**停掉后续全部测试**（issue #5 复发面）。
+    import pytest as _pytest
+    _pytest.skip("被测符号 traverse 缺失（脚本模式会 exit 1）", allow_module_level=True)
 _TV_SRC = ast.get_source_segment(_SRC, _TV)
 #: `traverse` 依赖的模块级常量（与 core.py 同值：`_SQL_IN_CHUNK = 900`）。
 #: 从源码里**读**出来而不是硬编码，避免本守卫与被测文件各写一份。
@@ -224,5 +229,9 @@ check('C `rel_clause` / `params` 原样沿用（类型过滤语义未变）',
 check('C importance 补全仍按 `_SQL_IN_CHUNK` 分批（#417 未回退）',
       "for i in range(0, len(ids), _SQL_IN_CHUNK):" in _ts, '')
 
-print(f'\n=== traverse 整层批量守卫: {pass_n}/{pass_n + fail_n} 通过 ===')
-sys.exit(0 if fail_n == 0 else 1)
+def main():
+    print(f'\n=== traverse 整层批量守卫: {pass_n}/{pass_n + fail_n} 通过 ===')
+    sys.exit(0 if fail_n == 0 else 1)
+
+if __name__ == "__main__":
+    main()

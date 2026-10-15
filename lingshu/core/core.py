@@ -289,6 +289,29 @@ def _finite_clamp(x, lo: float, hi: float, default: float = None) -> float:
     return max(lo, min(hi, _finite_or(x, default)))
 
 
+def _to_int_or(raw, default: int, lo: int = 1) -> int:
+    """把**可能来自盘面**的整数值入参归一为 `>= lo` 的 int（坏值 → `default`）。
+
+    lingshu #655：`context_max` 的读取面与设置面此前各写一份
+    `int(float(raw))`，`except` 只捕 `(TypeError, ValueError)`。但
+    `float("1e400") == inf`、`float(10**400)` 溢出 ⇒ `int(inf)` 抛
+    **`OverflowError`**（不被捕获）：
+    ① 盘面 `engine_meta["context_max"]="1e400"` ⇒ `SpacetimeMemoryEngine()`
+    **构造即崩**（整个库打不开）；
+    ② `set_context_cap(float("inf"))` 抛 `OverflowError`，且该坏值会被
+    `set_meta` 写进盘面 ⇒ 把 ① 变成持久故障。
+    归一口径（工程 fail-closed）：坏值回落到 `default`（**不抛异常**），与
+    同文件 `_finite_clamp` 的归一惯例一致；正常值再钳到 `>= lo`。**只此一处
+    实现**——读取面与设置面共用，避免同一表达式两处各修一次而漏一处。
+    判据来源：公开 issue #655。
+    边界（削掉的判别力）：调用方传坏值不会收到报错信号。
+    """
+    try:
+        return max(lo, int(float(raw)))
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 def _is_meta_category(category) -> bool:
     """`category` 规范化（`strip().lower()`）后是否等于 `"meta"`（lingshu #386）。
 
@@ -4854,7 +4877,11 @@ class LayeredStore:
             c.execute("SELECT * FROM escalation_points WHERE enabled=1")
         else:
             c.execute("SELECT * FROM escalation_points")
-        return [{"id": r[0], "code": r[1], "trigger": r[2], "condition": r[3],
+        # #656：trigger/condition 允许为 NULL，原样回填会让下游
+        # `check_escalation` 的 `in` 抛
+        # TypeError: argument of type 'NoneType' is not iterable
+        # 归一口径与同行 `enabled: bool(r[6])` 一致（见 issue #656）。
+        return [{"id": r[0], "code": r[1], "trigger": r[2] or "", "condition": r[3] or "",
                  "action": r[4], "severity": r[5], "enabled": bool(r[6]), "created_at": r[7]}
                 for r in c.fetchall()]
 
@@ -6286,11 +6313,7 @@ class SpacetimeMemoryEngine:
         不触发淘汰）——与 `set_context_cap` 的显式淘汰面区分。
         """
         raw = self.store.get_meta("context_max").get("context_max")
-        try:
-            val = int(float(raw))
-        except (TypeError, ValueError):
-            return self.DEFAULT_CONTEXT_MAX
-        return max(1, val)
+        return _to_int_or(raw, self.DEFAULT_CONTEXT_MAX)
 
     def set_context_cap(self, max_size: int):
         """设置情境层容量上限（FIFO 上限，至少 1）——#246：跨进程持久化。
@@ -6300,8 +6323,11 @@ class SpacetimeMemoryEngine:
         `int(float(...))` 归一：旧实现无 `int()`，浮点 `200.0` 会落到
         `enforce_context_cap` 的列表切片抛 `TypeError`（分诊表 246 实证）。
         判据来源：分诊表 `triage_lingshu_rest.md` 行 246。
+        #655：盘面坏值（非有限/超大）经 `_to_int_or` 回落 `DEFAULT_CONTEXT_MAX`
+        （fail-closed）——旧写法在此抛 `OverflowError`，且该值会被 `set_meta`
+        写进盘面，使**下次构造**也失败。判据来源：公开 issue #655。
         """
-        self._context_max = max(1, int(float(max_size)))
+        self._context_max = _to_int_or(max_size, self.DEFAULT_CONTEXT_MAX)
         self.store.set_meta("context_max", str(self._context_max))
         self.store.enforce_context_cap(self._context_max)
 
@@ -9940,7 +9966,10 @@ class SpacetimeMemoryEngine:
     def find_rejected_paths(self, query: str, limit: int = 10) -> List[Dict]:
         """A-1：相似被拒路径检索（防重复失败；供盲区学习闭环消费）"""
         paths = self.store.list_rejected_paths(status="open")
-        scored = [(p, LayeredStore.char_bigram_jaccard(query, p["description"] + p["reason"]))
+        # #657：description/reason 允许为 NULL，直接 `+` 会抛
+        # TypeError: unsupported operand type(s) for +: 'NoneType' and 'NoneType'
+        scored = [(p, LayeredStore.char_bigram_jaccard(query,
+                                                       (p["description"] or "") + (p["reason"] or "")))
                   for p in paths]
         scored.sort(key=lambda x: -x[1])
         return [p for p, s in scored if s > 0.15][:limit]

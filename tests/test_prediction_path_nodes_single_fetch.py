@@ -146,5 +146,9 @@ check('D 两方法在 nodes=None 时仍等价旧行为',
       and _n._branch_diversity(["a", "b"]) == 0.75, '')
 check('D 回落路径的 get_node 次数 = 2N', _e.store.calls == 4, f'实测 {_e.store.calls}')
 
-print(f'\n=== 路径节点「取一次」守卫: {pass_n}/{pass_n + fail_n} 通过 ===')
-sys.exit(0 if fail_n == 0 else 1)
+def main():
+    print(f'\n=== 路径节点「取一次」守卫: {pass_n}/{pass_n + fail_n} 通过 ===')
+    sys.exit(0 if fail_n == 0 else 1)
+
+if __name__ == "__main__":
+    main()

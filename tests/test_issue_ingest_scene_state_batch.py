@@ -94,5 +94,9 @@ if _fn is not None:
           'def ingest_scene(agent, scene_desc, store=None, tag: str = "spatial",' in _src
           and 'relations: Optional[List[Tuple[str, str, str]]] = None)' in _src, '')
 
-print(f'\n=== ingest_scene 状态批量提交守卫: {pass_n}/{pass_n + fail_n} 通过 ===')
-sys.exit(0 if fail_n == 0 else 1)
+def main():
+    print(f'\n=== ingest_scene 状态批量提交守卫: {pass_n}/{pass_n + fail_n} 通过 ===')
+    sys.exit(0 if fail_n == 0 else 1)
+
+if __name__ == "__main__":
+    main()
