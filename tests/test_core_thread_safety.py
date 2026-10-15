@@ -52,6 +52,10 @@ _WRITE_GUARD_WHITELIST = {
     ("LayeredStore", "_tx"):
         "装饰器实现本体：@_transactional 的 wrapper 调用的就是它——若给它再套装饰器即"
         "无限递归。其自身即事务边界（正常 commit / 异常 rollback 后原样抛）。",
+    ("LayeredStore", "_commit_locked"):
+        "**事务内提交**辅助（#665）：@_transactional 方法体内的 `self.conn.commit()` 一律"
+        "改走它——只有最外层（depth==1）真提交，内层退回 SAVEPOINT RELEASE。它不自己开"
+        "事务，只委托自身 `self.conn.commit()` / `RELEASE SAVEPOINT`，故不挂装饰器。",
     ("LayeredStore", "increment_access_many"):
         "**旁路写**形态（`increment_access` 的批量入口，PR #513 把两处实现收成这一个单点）："
         "另开独立连接 `sqlite3.connect(self.db_path, timeout=0)` 并自带 try/finally: "

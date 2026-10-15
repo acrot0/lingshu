@@ -998,6 +998,11 @@ def _transactional(fn):
     @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):
         with self._tx():
+            # 嵌套感知（#665）：内层不得终结外层事务——_tx 在 depth>1 时用 SAVEPOINT，
+            # 且本文件里 @_transactional 方法内的 `self.conn.commit()` 一律改走
+            # `self._commit_locked()`：只有最外层（depth==1）真提交，内层提交被推迟到
+            # 最外层退出时统一执行，否则外层 rollback 撤不回内层已提交的写。
+
             return fn(self, *args, **kwargs)
     return wrapper
 
@@ -1190,6 +1195,29 @@ class LayeredStore:
             slot = self._connect(self._memory_dsn or self.db_path)
         return slot.conn
 
+    def _commit_locked(self):
+        """事务内提交（#665）：只有**最外层**事务真提交，嵌套层提交被推迟。
+
+        为什么必须这样：`@_transactional` 方法体里普遍写着
+        `c = self.conn.cursor(); c.execute(...); self.conn.commit()`。一旦该方法是被
+        另一个 `@_transactional` 方法调进来的（真实路径：`ingest_frame` → `add_edge`/
+        `add_node`/`tag_node`；`import_all` → `add_node`；`annotate_semantics` → …），
+        这句 `commit()` 提交的是**整条**事务（SQLite 无真嵌套），并**顺手销毁外层已开的
+        SAVEPOINT** —— 随后外层无论 RELEASE 还是 ROLLBACK TO 都会撞
+        `sqlite3.OperationalError: no such savepoint`，或更糟：外层失败 rollback 时
+        内层写已落地、撤不回来（#665 的原始症状）。
+
+        判据：在 `conn.in_transaction` 为真且当前处于嵌套层（有 SAVEPOINT 在栈上）时，
+        本方法必须是 **no-op**，把提交权交给最外层 `_tx` 退出时的 `conn.commit()`。
+        最外层 `_tx` 用 `BEGIN IMMEDIATE` 开局，故 `in_transaction` 为真**不能**作为
+        「该提交」的判据 —— 只有最外层 `_tx` 自己（走 `else: conn.commit()` 分支）
+        才提交。
+        """
+        if self._tx_depth > 1:
+            # 嵌套层：提交权推迟给最外层，避免销毁外层 SAVEPOINT。
+            return
+        self.conn.commit()
+
     @contextlib.contextmanager
     def _tx(self):
         """写事务边界：正常提交、异常回滚。
@@ -1200,18 +1228,59 @@ class LayeredStore:
         写锁不放（其它写者等满 busy_timeout=30000ms 后报 database is locked）。
         本上下文管理器把「execute → commit」收成单一原子边界，异常必定 rollback
         后原样抛出。
+
+        #665：本方法过去**无嵌套感知**——内层退出即 `conn.commit()`，而 SQLite
+        并没有真正的嵌套事务，那次 commit 提交的是**整条**（唯一那条）事务 ⇒ 外层
+        随后失败时 rollback 已无处可撤，内层已落的写永久留下。真实路径存在：
+        `ingest_frame`（@_transactional）内部调用 `add_edge`/`add_node`/`tag_node`
+        （同为 @_transactional）。判据：外层方法在**内层调用之后**抛异常，内层已
+        写入的行必须不存在。
+
+        修法与同文件 `_structure_event_transaction` 同构：已在事务中
+        （`conn.in_transaction` 为真）⇒ 用 SAVEPOINT 只圈住自己这一段，退出时
+        RELEASE（不提交整条），异常时 ROLLBACK TO 后 RELEASE（只撤自己这一段）；
+        不在事务中 ⇒ 维持原语义（正常 commit、异常 rollback）。嵌套层数由 SQLite
+        的 `in_transaction` 天然给出，无需自维护计数器。
         """
         conn = self.conn
+        nested = conn.in_transaction
+        savepoint = "_tx_%s" % uuid.uuid4().hex
+        # ★ 最外层必须**真的开**一个事务（#665 修复的第二个要点）：
+        # 旧实现只「装饰」不「开始」——`yield` 前不 BEGIN，于是嵌套判定
+        # `conn.in_transaction` 在外层进入时恒为 False ⇒ 外层被当成最外层、
+        # 内层也被当成最外层，两层各自 commit，外层 rollback 撤不回内层。
+        # 用 BEGIN IMMEDIATE 显式开局：一是让 in_transaction 立刻为真（嵌套
+        # 判定才有据可依），二是立即取写锁，避免「先读后写」升级锁时的
+        # SQLITE_BUSY 竞态（与 _structure_event_transaction 同口径）。
+        if nested:
+            conn.execute("SAVEPOINT %s" % savepoint)
+        else:
+            conn.execute("BEGIN IMMEDIATE")
+        # 嵌套深度：#665 的关键配套。`_commit_locked()` 靠它判断「我这一层该不该
+        # 真提交」——只有 depth==1（最外层）提交，depth>1 一律推迟，否则会销毁
+        # 外层 SAVEPOINT。深度必须与 SAVEPOINT 栈同生共死，故用 try/finally 兜底
+        # 递减：任何异常路径（含 ROLLBACK 自身失败）都不能让深度泄漏，否则该连接
+        # 后续所有写都会静默变成「永不提交」。
+        self._tx_depth = getattr(self, "_tx_depth", 0) + 1
         try:
             yield conn
         except BaseException:
             try:
-                conn.rollback()
+                if nested:
+                    conn.execute("ROLLBACK TO SAVEPOINT %s" % savepoint)
+                    conn.execute("RELEASE SAVEPOINT %s" % savepoint)
+                else:
+                    conn.rollback()
             except Exception:
                 pass
             raise
         else:
-            conn.commit()
+            if nested:
+                conn.execute("RELEASE SAVEPOINT %s" % savepoint)
+            else:
+                conn.commit()
+        finally:
+            self._tx_depth -= 1
 
     @_transactional
     def _init_tables(self):
@@ -1374,7 +1443,7 @@ class LayeredStore:
         # 建表完成 → 落 schema 版本标记（下次启动只读化守卫据此跳过建表块）
         c.execute("INSERT OR REPLACE INTO engine_meta (key, value) VALUES ('_schema_version', ?)",
                   (str(self.SCHEMA_VERSION),))
-        self.conn.commit()
+        self._commit_locked()
 
     # ---------- 节点操作 ----------
 
@@ -1519,7 +1588,7 @@ class LayeredStore:
                     outcome={"no_forget_in_new_tags": "no_forget" in node.tags,
                              "protections_row": node.id in set(self.get_protected_nodes()),
                              "old_tags": list(overwrite_protected.tags or [])})
-            self.conn.commit()
+            self._commit_locked()
         return node.id
 
     # ---- 引擎元数据（engine_meta key-value，跨进程持久化） ----
@@ -1542,7 +1611,7 @@ class LayeredStore:
             c = self.conn.cursor()
             c.execute("INSERT OR REPLACE INTO engine_meta (key, value) VALUES (?, ?)",
                       (key, str(value)))
-            self.conn.commit()
+            self._commit_locked()
 
     @contextmanager
     def _structure_event_transaction(self):
@@ -1551,6 +1620,12 @@ class LayeredStore:
             conn = self.conn
             nested = conn.in_transaction
             savepoint = f"structure_event_{uuid.uuid4().hex}"
+            # ★ #665：`nested` 必须同时把「已被 @_transactional 包裹」算进来。
+            # 单看 `conn.in_transaction` 不够——最外层 `_tx` 就是用它 BEGIN 的，
+            # 但**裸 `BEGIN IMMEDIATE` 在已开事务里会抛 `cannot start a transaction
+            # within a transaction`**；此处历史上只按 in_transaction 判，故凡是
+            # 走 `_tx` 进入的调用方都会踩到。用 `_tx_depth` 兜住这一层。
+            nested = nested or bool(getattr(self, "_tx_depth", 0))
             conn.execute(f"SAVEPOINT {savepoint}" if nested else "BEGIN IMMEDIATE")
             try:
                 yield conn.cursor()
@@ -1794,7 +1869,13 @@ class LayeredStore:
             # 「不可遗忘」判定——判定与 DELETE 共用同一写快照：窗口期已提交的保护行对本
             # 快照可见（拒删）；未提交的排在删除事务之后（保护落在已删节点＝既有语义，
             # 非本件竞态）。重读行防 t0 预读与写快照间节点被改写层。
-            self.conn.execute("BEGIN IMMEDIATE")
+            # ★ #665：本方法已挂 @_transactional，最外层事务已由 `_tx` 开好；此处再
+            # 裸 BEGIN IMMEDIATE 会抛「cannot start a transaction within a transaction」。
+            # 仅在「无人替我们开事务」时（_tx_depth==0）才需要自己开。
+            if getattr(self, "_tx_depth", 0):
+                pass  # 事务已由 _tx 开启，且写锁已拿到，无需重复 BEGIN
+            else:
+                self.conn.execute("BEGIN IMMEDIATE")
             node = self.get_node(node_id)
             if node is None or node.layer in self.IMMUTABLE_LAYERS:
                 return False
@@ -1837,7 +1918,7 @@ class LayeredStore:
                                json.dumps({"reason": "opposite_edge_gone",
                                            "removed_node": node_id}, ensure_ascii=False),
                                json.dumps({}, ensure_ascii=False)))
-            self.conn.commit()
+            self._commit_locked()
         return True
 
     @_transactional
@@ -1857,7 +1938,7 @@ class LayeredStore:
                                   last_access = ?
                 WHERE id=?
             ''', (delta, time.time(), node_id))
-            self.conn.commit()
+            self._commit_locked()
 
     @staticmethod
     def _retrieval_touches_recency() -> bool:
@@ -1999,7 +2080,7 @@ class LayeredStore:
         with self._lock:
             c = self.conn.cursor()
             c.execute('INSERT OR REPLACE INTO edges VALUES (?,?,?,?,?,?,?,?,?,?,?)', edge.to_row())
-            self.conn.commit()
+            self._commit_locked()
         return edge.id
 
     def get_edge(self, edge_id: str) -> Optional[STEdge]:
@@ -2053,7 +2134,7 @@ class LayeredStore:
                     UPDATE edges SET verified=1, last_verified=?
                     WHERE id=?
                 ''', (now, edge_id))
-            self.conn.commit()
+            self._commit_locked()
 
     @_transactional
     def unverify_edge(self, edge_id: str) -> bool:
@@ -2961,7 +3042,7 @@ class LayeredStore:
                     continue
                 c.execute("UPDATE nodes SET confidence=? WHERE id=?",
                           (self._decay_value(conf, factor, dt), nid))
-            self.conn.commit()
+            self._commit_locked()
 
     # ==================== 检索层（M1） ====================
 
@@ -3388,7 +3469,7 @@ class LayeredStore:
             c = self.conn.cursor()
             c.execute("UPDATE nodes SET tags=? WHERE id=?", (_dumps_tags(node.tags), node_id))
         if own_tx:
-            self.conn.commit()
+            self._commit_locked()
 
     # ==================== 情境层（M4） ====================
 
@@ -3465,7 +3546,7 @@ class LayeredStore:
         c.execute("INSERT INTO blindspots (id, code, description, severity, category, status, created_at, resolved_at, predictability) VALUES (?,?,?,?,?,?,?,?,?)",
                   (bid, code, description, severity, category, "open", time.time(), None,
                    predictability))
-        self.conn.commit()
+        self._commit_locked()
         return bid
 
     def list_blindspots(self, status: str = None) -> List[Dict]:
@@ -3510,7 +3591,7 @@ class LayeredStore:
         c = self.conn.cursor()
         c.execute("UPDATE blindspots SET status='resolved', resolved_at=? WHERE id=?",
                   (time.time(), blindspot_id))
-        self.conn.commit()
+        self._commit_locked()
 
     # ==================== 技能记忆（M9） ====================
 
@@ -3521,7 +3602,7 @@ class LayeredStore:
         c = self.conn.cursor()
         c.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?)",
                   (sid, name, description, procedure, confidence, 1, time.time(), time.time()))
-        self.conn.commit()
+        self._commit_locked()
         return sid
 
     @staticmethod
@@ -3621,7 +3702,7 @@ class LayeredStore:
         c = self.conn.cursor()
         c.execute("UPDATE skills SET confidence = MIN(1.0, MAX(0.0, confidence + ?)), updated_at=? WHERE id=?",
                   (delta, time.time(), skill_id))
-        self.conn.commit()
+        self._commit_locked()
 
     # ==================== 固化流水线（M6 · D-003 终裁门槛） ====================
 
@@ -3690,7 +3771,7 @@ class LayeredStore:
                   " VALUES (?,?,?,?,?,?,?,?,?,?)",
                   (pid, node_id, requester, reason, "", "", "pending", time.time(),
                    None, chash))
-        self.conn.commit()
+        self._commit_locked()
         return pid
 
     @_transactional
@@ -3719,7 +3800,7 @@ class LayeredStore:
             return False  # 身份互斥：提议人不得自兼复核
         c.execute("UPDATE promotion_proposals SET verified_by=?, status='verified' WHERE id=?",
                   (verified_by, proposal_id))
-        self.conn.commit()
+        self._commit_locked()
         return True
 
     @_transactional
@@ -3797,7 +3878,7 @@ class LayeredStore:
             c.execute("UPDATE promotion_proposals SET adjudicated_by=?, status=?, decided_at=?"
                       " WHERE id=?",
                       (adjudicated_by, "rejected", time.time(), proposal_id))
-            self.conn.commit()
+            self._commit_locked()
             try:
                 self.log_action(
                     "promotion_node_missing",
@@ -3812,13 +3893,13 @@ class LayeredStore:
             c.execute("UPDATE promotion_proposals SET adjudicated_by=?, status=?, decided_at=?"
                       " WHERE id=?",
                       (adjudicated_by, "rejected", time.time(), proposal_id))
-            self.conn.commit()
+            self._commit_locked()
             return None
         if approved:
             c.execute("UPDATE nodes SET layer='structure', confidence=1.0 WHERE id=?", (node_id,))
         c.execute("UPDATE promotion_proposals SET adjudicated_by=?, status=?, decided_at=? WHERE id=?",
                   (adjudicated_by, "approved" if approved else "rejected", time.time(), proposal_id))
-        self.conn.commit()
+        self._commit_locked()
         return node_id
 
     # ==================== 遗忘门控（M7） ====================
@@ -3858,7 +3939,7 @@ class LayeredStore:
             node.tags.append("no_forget")
             c.execute("UPDATE nodes SET tags=? WHERE id=?", (_dumps_tags(node.tags), node_id))
         if own_tx:
-            self.conn.commit()
+            self._commit_locked()
 
     def get_protected_nodes(self) -> List[str]:
         """取保护名单节点 id 列表（不可遗忘层的豁免集合）。"""
@@ -3950,7 +4031,7 @@ class LayeredStore:
             if "conflict" not in _tlist:
                 _tlist.append("conflict")
                 c.execute("UPDATE nodes SET tags=? WHERE id=?", (_dumps_tags(_tlist), nid))
-                self.conn.commit()
+                self._commit_locked()
         return edge
 
     @_transactional
@@ -4003,7 +4084,7 @@ class LayeredStore:
                 # #168：删边经唯一真源（对不可变层对端的边先落审计）
                 self._strip_incident_edges(c, nid)
                 c.execute("DELETE FROM nodes WHERE id=?", (nid,))
-            self.conn.commit()
+            self._commit_locked()
         return len(doomed)
 
     def count_layer(self, layer: MemoryLayer) -> int:
@@ -4082,7 +4163,7 @@ class LayeredStore:
         c = self.conn.cursor()
         resolved_at = time.time() if status != "open" else None
         c.execute("UPDATE blindspots SET status=?, resolved_at=? WHERE id=?", (status, resolved_at, blindspot_id))
-        self.conn.commit()
+        self._commit_locked()
 
     # ==================== v1.4 扩展（P1-1/P1-2/P1-3/P1-4） ====================
 
@@ -4119,7 +4200,7 @@ class LayeredStore:
         c = self.conn.cursor()
         c.execute("UPDATE nodes SET importance = MIN(1.0, MAX(0.0, importance + ?)) WHERE id=?",
                   (delta, node_id))
-        self.conn.commit()
+        self._commit_locked()
 
     def recalc_structural_importance(self, dry_run: bool = True,
                                      boost_cap: float = 0.15,
@@ -4317,7 +4398,7 @@ class LayeredStore:
         sa[key] = infl
         c.execute("UPDATE nodes SET state_attributes=? WHERE id=?",
                   (_dumps_json(sa, ensure_ascii=False, where="state_attributes"), node_id))
-        self.conn.commit()
+        self._commit_locked()
 
     @staticmethod
     def _state_attr_of(sa_raw, key: str, default=None):
@@ -4515,7 +4596,7 @@ class LayeredStore:
                   (_dumps_json(sa, ensure_ascii=False, where="state_attributes"),
                    _dumps_tags(tags, ensure_ascii=False),
                    new_imp, insight_id))
-        self.conn.commit()
+        self._commit_locked()
         return {"node_id": insight_id, "level": level, "status": status,
                 "evidence_count": len(ev), "importance": new_imp}
 
@@ -4620,7 +4701,7 @@ class LayeredStore:
         merged = f"{proc} → {step}" if proc else step
         c.execute("UPDATE skills SET procedure=?, version=version+1, updated_at=? WHERE id=?",
                   (merged, time.time(), skill_id))
-        self.conn.commit()
+        self._commit_locked()
 
     # ==================== v1.5 扩展（A-1/A-2/A-3） ====================
 
@@ -4632,7 +4713,7 @@ class LayeredStore:
         c = self.conn.cursor()
         c.execute("INSERT INTO rejected_paths VALUES (?,?,?,?,?,?,?,?)",
                   (rid, path_type, description, reason, evidence, "open", time.time(), None))
-        self.conn.commit()
+        self._commit_locked()
         return rid
 
     def list_rejected_paths(self, status: str = None) -> List[Dict]:
@@ -4662,7 +4743,7 @@ class LayeredStore:
         c = self.conn.cursor()
         c.execute("UPDATE rejected_paths SET status='consumed', consumed_at=? WHERE id=?",
                   (time.time(), rejected_id))
-        self.conn.commit()
+        self._commit_locked()
 
     @_transactional
     def add_verifier_standard(self, name: str, param: str, value: float, reason: str,
@@ -4673,7 +4754,7 @@ class LayeredStore:
         c.execute("INSERT INTO verifier_standards VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                   (vid, name, param, value, reason, proposer, "", "", "", "pending",
                    time.time(), None))
-        self.conn.commit()
+        self._commit_locked()
         return vid
 
     def list_verifier_standards(self, status: str = None) -> List[Dict]:
@@ -4708,7 +4789,7 @@ class LayeredStore:
         status = "reviewed" if approved else "rejected"
         c.execute("UPDATE verifier_standards SET independent_reviewer=?, status=? WHERE id=?",
                   (reviewer, status, vid))
-        self.conn.commit()
+        self._commit_locked()
         return True
 
     @_transactional
@@ -4729,7 +4810,7 @@ class LayeredStore:
         status = "cs_approved" if approved else "cs_rejected"
         c.execute("UPDATE verifier_standards SET cs_reviewer=?, status=? WHERE id=?",
                   (reviewer, status, vid))
-        self.conn.commit()
+        self._commit_locked()
         return True
 
     # 无 @_transactional：#429 起本方法要么由调用方经 `_cursor` 传入事务，要么自开
@@ -4785,7 +4866,7 @@ class LayeredStore:
         c = self.conn.cursor()
         c.execute("INSERT INTO escalation_points VALUES (?,?,?,?,?,?,?,?)",
                   (eid, code, trigger, condition, action, severity, 1, time.time()))
-        self.conn.commit()
+        self._commit_locked()
         return eid
 
     @_transactional
@@ -4805,7 +4886,7 @@ class LayeredStore:
                    json.dumps(node_ids or [], ensure_ascii=False),
                    json.dumps(outcome or {}, ensure_ascii=False),
                    json.dumps(context or {}, ensure_ascii=False)))
-        self.conn.commit()
+        self._commit_locked()
 
     @_transactional
     def set_escalation_enabled(self, escalation_id: str, enabled: bool,
@@ -4894,6 +4975,15 @@ class SpacetimeMemoryEngine:
     #: 判据来源：经验标定（本件 #426）——仓内无规定视觉锚点数上限的理论章节，
     #: 追不到更早出处。
     MAX_VPRIM_ANCHORS = 32
+
+    def _commit_locked(self):
+        """事务内提交（委托 store，语义见 LayeredStore._commit_locked）。
+
+        #665：Engine 侧 `@_transactional` 方法同样在方法体里写
+        `self.conn.commit()`（`self.conn` 即 store 连接），必须一并改走本方法，
+        否则内层 engine 方法一样会提交整条事务、销毁外层 SAVEPOINT。
+        """
+        return self.store._commit_locked()
 
     @contextlib.contextmanager
     def _tx(self):
@@ -6305,7 +6395,7 @@ class SpacetimeMemoryEngine:
                 c = self.store.conn.cursor()
                 c.execute("UPDATE nodes SET tags=? WHERE id=?",
                           (_dumps_tags(node.tags), node_id))
-                self.store.conn.commit()
+                self._commit_locked()
             if not approved:
                 # A-1：被拒绝的固化提案 → 被拒绝路径资产
                 content = node.content[:60] if node else proposal_id
@@ -9210,7 +9300,7 @@ class SpacetimeMemoryEngine:
                 c = self.store.conn.cursor()
                 c.execute("UPDATE nodes SET semantic_coordinates=? WHERE id=?",
                           (_dumps_json(se, where="semantic_coordinates"), node.id))
-                self.store.conn.commit()
+                self._commit_locked()
         if entity_id:
             self._last_frame[entity_id] = node.id
         if "frame_ref" in frame_data:
@@ -9435,7 +9525,7 @@ class SpacetimeMemoryEngine:
         c = self.store.conn.cursor()
         c.execute("UPDATE nodes SET semantic_coordinates=? WHERE id=?",
                   (_dumps_json(merged, where="semantic_coordinates"), node_id))
-        self.store.conn.commit()
+        self._commit_locked()
         return True
 
     def compiler_introspect(self) -> Dict:
@@ -9792,7 +9882,7 @@ class SpacetimeMemoryEngine:
                 node_ids=[i for i in immutable_rows if i],
                 outcome={"requires_review": True, "immutable_rows": len(immutable_rows),
                          "relayer_rows": len(relayer_rows)})
-        self.store.conn.commit()
+        self._commit_locked()
         # 恢复自检：导入后跑 `PRAGMA foreign_key_check` 体检。经上方 #93 预筛，正常
         # 路径下应恒为空；保留本步作为「白名单列裁剪后仍出现悬挂」的兜底观测
         # （不拦写入，随返回值交付）。
@@ -10196,7 +10286,7 @@ class SpacetimeMemoryEngine:
                        (self._gap_history[-1]["ts"], dn))
             sc.execute("DELETE FROM gap_history WHERE id NOT IN"
                        " (SELECT id FROM gap_history ORDER BY id DESC LIMIT 2000)")
-            self.store.conn.commit()
+            self._commit_locked()
         except Exception:
             pass
         return d_norm
@@ -10799,7 +10889,7 @@ class SpacetimeMemoryEngine:
                     archived += 1
                 else:
                     kept += 1
-            self.store.conn.commit()
+            self._commit_locked()
         return {"archived": archived, "kept": kept,
                 "note": "主动遗忘：未被使用的 CONTEXT 记忆归档（importance 降权，可逆）"}
 
